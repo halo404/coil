@@ -1,0 +1,437 @@
+    #include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+
+#define path_length 15000    		/*道路总长度*/
+#define car_length 15				/*车长*/
+#define car_v_max 75				/*最大速度*/
+#define A 0.55						/*即α*/
+#define B 1.3						/*即β*/	
+#define Pb 94						/*CD模型下的三种随机慢化概率*/
+#define Pd 10
+#define Po 50
+#define h 6						- 	/*刹车灯的影响范围*/
+#define gap_safety 7				/*安全距离*/
+#define ground_coil_position 14000	/*地面线圈位置*/
+#define ground_coil_gap 30			/*地面线圈输出间隔*/
+#define tc 10						/*停车时间上限*/
+#define time_run 50000				/*车辆总的运行时步数*/
+#define time_test 10000				/*测试时步数*/
+#define satd_steps 2000				/*时空分布图时步数*/
+#define samples 1
+
+typedef struct car
+{
+	int position;
+	int v;
+	int brake_light;				/*刹车灯。1为灯亮，0为灯灭*/
+	int tst;						/*车辆累积停止时间*/
+	int last_position;				/*记录上一时步位置*/
+}CAR;
+
+float initial_occupation_rate = 0.10; 
+int car_sum_num;
+
+int judge_road_initial(int *ric, int ip)		/*判断能否洒车。ric即记录道路初始化情况的road_initial_condition数组，ip即由随机数产生的计划洒车点initial_position*/
+{
+	int i, k = ((ip + car_length) < path_length) ? (ip + car_length) : (ip + car_length - path_length);
+
+	for(i = ip ;; i++)
+	{
+		i = (i < path_length) ? i : (i - path_length);
+		if(i == k)
+			break;
+		if(ric[i] == 1)
+			return 0;
+	}
+	return 1; 
+}
+
+void car_initial_sort(CAR *car)		    		/*将已经洒下去的车按照位置先后进行降序排列，且令最前面的车为头车，位于当前结构体数组的下标0处*/
+{
+	CAR temp;
+	int i, j, max;
+
+	for(i = 0 ; i < (car_sum_num - 1) ; i++)
+	{
+		max = i;
+		for(j = i + 1 ; j < car_sum_num ; j++)
+			if(car[j].position > car[max].position)
+				max = j;
+		if(max != i)
+		{
+			temp = car[i];
+			car[i] = car[max];
+			car[max] = temp;
+		}
+	}
+}
+
+int random_road_initial(CAR *car, int *ric)		/*随机洒车*/
+{
+	int initial_position, i, j, k, failure_time;
+	
+	for(i = 0 ; i < car_sum_num ; i++)
+	{
+        failure_time = -1;
+		do
+		{
+			initial_position = rand() % path_length;
+			failure_time ++;
+		}while((judge_road_initial(ric, initial_position) == 0) && (failure_time <= 20000));
+		if(failure_time > 20000)
+            return 0;
+		k = ((initial_position + car_length) < path_length) ? (initial_position + car_length) : (initial_position + car_length - path_length);
+		for(j = initial_position ;; j++)
+		{
+			j = (j < path_length) ? j : (j - path_length);
+			if(j == k)
+				break;
+			ric[j] = 1;
+		}
+		car[i].position = car[i].last_position = initial_position;
+		car[i].v = 0;
+		car[i].brake_light = 0;
+		car[i].tst = 0;
+	}
+	car_initial_sort(car);
+	return 1; 
+}
+
+void average_road_initial(CAR *car) 			/*均匀洒车*/
+{
+	int gap = (path_length - car_sum_num * car_length) / car_sum_num, i;
+	
+	car[car_sum_num - 1].position = car[car_sum_num - 1].last_position = 0;
+	car[car_sum_num - 1].v = 0;
+	car[car_sum_num - 1].brake_light = 0;
+	car[car_sum_num - 1].tst = 0;
+	
+	for(i = car_sum_num - 2 ; i >= 0 ; i--)
+	{
+		car[i].position = car[i].last_position = ((car[i + 1].position + gap + car_length) < path_length) ? (car[i + 1].position + gap + car_length) : (car[i + 1].position + gap + car_length - path_length);
+		car[i].v = 0;
+		car[i].brake_light = 0;
+		car[i].tst = 0;
+	}
+}
+
+void compact_road_initial(CAR *car) 			/*致密洒车*/
+{
+	int i;
+	
+	car[car_sum_num - 1].position = car[car_sum_num - 1].last_position = 0;
+	car[car_sum_num - 1].v = 0;
+	car[car_sum_num - 1].brake_light = 0;
+	car[car_sum_num - 1].tst = 0;
+	
+	for(i = car_sum_num - 2 ; i >= 0 ; i--)
+	{
+		car[i].position = car[i].last_position = ((car[i + 1].position + car_length) < path_length) ? (car[i + 1].position + car_length) : (car[i + 1].position + car_length - path_length);
+		car[i].v = 0;
+		car[i].brake_light = 0;
+		car[i].tst = 0;
+	}
+} 
+
+int car_gap_calculate(int a, int b)				/*车间距计算。a为当前车的位置，b为前车的位置*/ 
+{	
+	if(b >= a)
+		return (b - a - car_length);
+	else
+		return (b + path_length - a - car_length);
+}
+
+int CD_random_sd_probability(CAR *car, int n, double *th, double *ts)		/*计算基于CD模型下计算随机慢化概率。n为当前车的数组下标*/
+{
+	int k;		
+	
+	if(car_sum_num == 1)
+	{
+		(*th) = 0;
+		(*ts) = (car[n].v < h) ? car[n].v : h;
+		return Pd;
+	}									
+		
+	if(n == 0)
+		k = (car_sum_num - 1);
+	else
+		k = (n - 1);
+		
+	if(car_gap_calculate(car[n].position, car[k].position) <= 0)
+		(*th) = 0;
+	else
+	{
+		if(car[n].v == 0)
+			(*th) = 99999;
+		else
+			(*th) = ((car_gap_calculate(car[n].position, car[k].position) * 1.0) / car[n].v);
+	}
+	
+	(*ts) = (car[n].v < h) ? car[n].v : h;
+	
+	if((car[k].brake_light == 1) && ((*th) < (*ts)))
+		return Pb;
+	if((car[n].v == 0) && (car[n].tst >= tc))
+		return Po;
+	return Pd;
+}
+
+void CD_car_v_update(CAR *car)								/*基于CD模型下的车速更新系统*/
+{
+	double th, ts;
+	int i, k, t, pp, v_anti, dn_eff, v_n_t, l_n_t, v_nn_t, l_nn_t, random;	/*k为前车的下标，t为前车的前车下标。pp为计算出的随机慢化概率，v_anti为前车的期望速度，dn_eff为前后车的有效距离，v_n_t暂存当前车的原速，l_n_t暂存当前车原刹车灯的状态，v_nn_t暂存前车的原速，l_nn_t暂存前车原刹车灯的状态*/
+
+	v_nn_t = car[car_sum_num - 1].v;
+	l_nn_t = car[car_sum_num - 1].brake_light;
+	
+	for(i = 0 ; i <= (car_sum_num - 1) ; i++)
+	{
+		v_n_t = car[i].v;
+		l_n_t = car[i].brake_light;
+
+		if(i == 0)
+			k = (car_sum_num - 1);
+		else
+			k = (i - 1);
+		if(k == 0)
+			t = (car_sum_num - 1);
+		else
+			t = (k - 1);
+			
+		pp = CD_random_sd_probability(car, i, &th, &ts);							/*确定随机慢化概率*/
+
+		if((((l_nn_t == 0) || (th >= ts)) && (v_n_t > 0)) || (car_sum_num == 1))	/*加速*/
+			car[i].v = ((car[i].v + 2) < car_v_max) ? (car[i].v + 2) : car_v_max;
+		else if(car[i].v == 0)
+			car[i].v = ((car[i].v + 1) < car_v_max) ? (car[i].v + 1) : car_v_max;
+		else
+			car[i].v = car[i].v;
+
+		if(car_sum_num != 1)
+		{
+			v_anti = (car_gap_calculate(car[k].position, car[t].position) < v_nn_t) ? car_gap_calculate(car[k].position, car[t].position) : v_nn_t;
+			dn_eff = car_gap_calculate(car[i].position, car[k].position) + (((v_anti - gap_safety) > 0) ? (v_anti - gap_safety) : 0);
+			car[i].v = (dn_eff < car[i].v) ? dn_eff : car[i].v;						/*减速*/
+		} 
+
+		random = rand() % 100;
+		if(random < pp)																/*慢化*/
+			car[i].v = ((car[i].v - 1) > 0) ? (car[i].v - 1) : 0;
+
+		if(car[i].v < v_n_t)														/*确定刹车灯状态*/
+			car[i].brake_light = 1;
+		else if(car[i].v > v_n_t)
+			car[i].brake_light = 0;
+		else
+			car[i].brake_light = l_n_t;
+
+		if(car[i].v == 0)															/*确定tst*/
+			car[i].tst ++;
+		else
+			car[i].tst = 0;
+			
+		v_nn_t = v_n_t;
+	    l_nn_t = l_n_t;
+	}
+}
+
+void car_position_update(CAR *car)					/*车辆位置更新*/
+{
+	int i;
+
+	for(i = 0 ; i < car_sum_num ; i++)
+		car[i].position = ((car[i].position + car[i].v) > path_length) ? (car[i].position + car[i].v - path_length) : (car[i].position + car[i].v);
+}
+
+double road_occupation_rate(void)					/*计算当前时步下的道路占有率*/
+{
+	return ((car_length * car_sum_num * 1.0) / path_length);
+}
+
+double road_density(void)							/*计算当前时步下的车流密度*/
+{
+	return ((car_sum_num * 1.0) / path_length);
+}
+
+double road_average_v(CAR *car)						/*计算当前时步下的车流平均速度*/
+{
+	int i, v_sum = 0;
+
+	for(i = 0 ; i <= (car_sum_num - 1) ; i++)
+		v_sum += car[i].v;
+
+	return ((v_sum * 1.0) / car_sum_num);
+}
+
+double road_car_flow(double a, double b)	      	/*计算当前时步下，道路的车流量。a为当前时步下的车流密度，b为当前时步下车流的平均速度*/
+{
+	return (a * b);
+}
+
+void satd_road_condition_update(int *rc, CAR *car, FILE *f, int step)
+{
+	int i, j, k;
+	
+	memset(rc, 0, sizeof(int) * path_length);
+	for(i = 0 ; i < car_sum_num ; i++)
+	{
+		rc[car[i].position] = 1;
+		for(j = 1 ; j <= (car_length - 1) ; j++)
+		{
+			k = ((car[i].position + j) < path_length) ? (car[i].position + j) : (car[i].position + j - path_length);
+			rc[k] = 2;
+		}
+	}
+	fprintf(f, "时步：%d\n", step);
+	for(i = 0 ; i < path_length ; i++)
+		fprintf(f, "%d\n", rc[i]);
+	fprintf(f, "\n");
+} 
+
+void satd_car_information_print(CAR *car, FILE *f, int step)
+{
+	int i, k, min_num, min_position = 99999;
+	
+	for(i = 0 ; i < car_sum_num ; i++)
+	{
+		if(car[i].position < min_position)
+		{
+			min_num = i;
+			min_position = car[i].position;
+		}
+	}
+	k = min_num;
+	fprintf(f, "时步：%d\n", step);
+	for(i = 1 ; i <= car_sum_num ; i++)
+	{
+		fprintf(f, "%d  %d\n", car[k].position, car[k].v);
+		k = (k == 0) ? (car_sum_num - 1) : (k - 1);
+	}
+	fprintf(f, "\n");
+}
+
+int main()
+{
+	FILE *a, *b, *c, *d, *e, *f;
+	int i, j, x, y, t, road_initial_condition[path_length] = {0}, road_condition[path_length] = {0}, init_failure_flag; 
+	double road_average_v_time_sum = 0, road_occupation_rate_time_sum = 0, road_density_time_sum = 0, road_car_flow_time_sum = 0,
+	       road_average_v_sample_sum = 0, road_occupation_rate_sample_sum = 0, road_density_sample_sum = 0, road_car_flow_sample_sum = 0,
+	       coil_car_sum_num = 0, coil_car_v_sum = 0;
+	CAR car[path_length / car_length + 10];
+	
+	a = fopen("1.txt", "w");
+	b = fopen("2.txt", "w");
+	c = fopen("satd1.txt", "w");
+	d = fopen("satd2.txt", "w");
+	e = fopen("coil1.txt", "w");
+	f = fopen("coil2.txt", "w");
+
+	for(x = 1 ; x <= 10 ; x++)
+	{
+		fprintf(a, "初始化道路总占有率：%f\n\n", initial_occupation_rate);
+		fprintf(b, "初始化道路总占有率：%f\n\n", initial_occupation_rate);
+		printf("初始化道路总占有率：%f 正在运算：\n", initial_occupation_rate);
+		
+		for(y = 1 ; y <= samples ; y++)
+		{
+			srand((unsigned int)y);
+			car_sum_num = (path_length * initial_occupation_rate) / car_length;
+			init_failure_flag = 1;
+			
+INIT_FAIL:	init_failure_flag = random_road_initial(car, road_initial_condition);
+			//average_road_initial(car);
+			//compact_road_initial(car);
+			if(init_failure_flag == 0)
+			{
+                 for(i = 0 ; i < path_length ; i++)
+				 	road_initial_condition[i] = 0;
+			     goto INIT_FAIL;
+            }
+            
+            t = ground_coil_gap;
+			
+			for(i = 1; i <= time_run ; i++)
+			{
+				CD_car_v_update(car);	
+				
+				if(i >= 2)
+				{
+					for(j = 0 ; j < car_sum_num ; j++)
+					{
+						if(((car[j].last_position < ground_coil_position) && (car[j].position >= ground_coil_position)) || ((car[j].last_position > ground_coil_position) && (car[j].position >= ground_coil_position) && (car[j].position < car[j].last_position)) || ((car[j].last_position < ground_coil_position) && (car[j].position <= ground_coil_position) && (car[j].position < car[j].last_position)))
+						{
+							coil_car_sum_num++;
+							coil_car_v_sum += car[j].v;
+						}
+						car[j].last_position = car[j].position;
+					}
+					
+					if(i == t)
+					{
+						if(i >= 10000)
+						{
+							fprintf(e, "%d %f\n", i, (coil_car_sum_num * 3600) / ground_coil_gap);
+							
+							fprintf(f, "%d ", i);
+							fprintf(f, "%f\n", (coil_car_sum_num == 0 ? 0 : coil_car_v_sum / coil_car_sum_num));
+						}
+
+						t += ground_coil_gap;
+						coil_car_sum_num = coil_car_v_sum = 0;
+					}
+				}	
+
+				if(i > (time_run - time_test))
+				{
+					road_average_v_time_sum += road_average_v(car);
+					road_occupation_rate_time_sum += road_occupation_rate();
+					road_density_time_sum += road_density();
+					road_car_flow_time_sum += road_car_flow(road_density(), road_average_v(car));
+				}
+				
+				if(i > (time_run - satd_steps))
+				{
+					//satd_road_condition_update(road_condition, car, c, i);
+					satd_car_information_print(car, d, i);
+				}
+
+				car_position_update(car);
+
+/*				if(i == 1)
+				{
+					for(j = 0 ; j < car_sum_num ; j++)
+					{
+						car[j].last_position = car[j].position;
+					}
+				}
+*/
+			}
+
+			fprintf(a, "样本%d：\n%f  %f  %f  %f\n\n", y, (road_occupation_rate_time_sum / time_test), (road_density_time_sum / time_test), (road_average_v_time_sum / time_test), (road_car_flow_time_sum / time_test));
+			printf("样本%d：OK...\n", y);
+			
+			road_average_v_sample_sum += (road_average_v_time_sum / time_test);
+			road_occupation_rate_sample_sum += (road_occupation_rate_time_sum / time_test);
+			road_density_sample_sum += (road_density_time_sum / time_test);
+			road_car_flow_sample_sum += (road_car_flow_time_sum / time_test);
+			
+			for(i = 0 ; i < path_length ; i++)
+				road_initial_condition[i] = 0;
+			road_average_v_time_sum = road_occupation_rate_time_sum = road_density_time_sum = road_car_flow_time_sum = 0;
+		}
+		fprintf(b, "%f  %f  %f  %f\n\n", (road_occupation_rate_sample_sum / samples), (road_density_sample_sum / samples), (road_average_v_sample_sum / samples), (road_car_flow_sample_sum / samples));
+		printf("\n");
+		
+		road_average_v_sample_sum = road_occupation_rate_sample_sum = road_density_sample_sum = road_car_flow_sample_sum = 0;
+		initial_occupation_rate += 0.1;
+	}
+	printf("数据已录入！\n");
+	fclose(a);
+	fclose(b);
+    fclose(c);
+	fclose(d);
+	fclose(e);
+	fclose(f);
+	return 0;
+}
